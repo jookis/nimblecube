@@ -63,8 +63,10 @@ of `uart` (or vice-versa).
 ### Expected
 
 - `sensor_read`: `raw=` jumps up when smoke reaches the sensor.
-- `gas_anomaly`: `enroll …` during warmup, then `mean=… d=… ok` in clean air and `… ANOMALY: smoke/gas`
-  under sustained smoke. Tune the threshold margin / persistence (`K`, `M`) in the source if it's too
+- `gas_anomaly`: `enroll …` for 8 clean-air windows after warmup, then `baseline level=…`, then
+  `mean=… rel=[…] d=… ok` in clean air and `… ANOMALY: smoke/gas` under sustained smoke. `rel` is the
+  encoded features in per mille of this unit's clean-air level (level over clean air, peak over the
+  window mean, slope), so a recorded signature means the same on another board. Tune the threshold margin / persistence (`K`, `M`) in the source if it's too
   twitchy or too slow.
 
 See [`../BENCHMARKS.md`](../BENCHMARKS.md) for measured on-chip numbers.

@@ -9,6 +9,7 @@ use esp_hal::main;
 use esp_println::println;
 
 use nimblecube_core::encode::FeatureEncoder;
+use nimblecube_core::features::{relative, Baseline, WindowStats, RELATIVE_RANGES};
 use nimblecube_core::store::FixedStore;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -30,9 +31,13 @@ fn main() -> ! {
     let mut adc = Adc::new(peripherals.ADC1, adc_config);
     let delay = Delay::new();
 
-    // Features: mean level, peak, slope - over the 12-bit ADC span.
-    let enc = FeatureEncoder::<3, 16>::new(7, [(0, 4095), (0, 4095), (-4095, 4095)]);
+    // Features: level over clean air, peak over the window mean, slope; all per mille of
+    // this unit's own clean-air level, so signatures carry across units (see features.rs).
+    let enc = FeatureEncoder::<3, 16>::new(7, RELATIVE_RANGES);
     let mut store: FixedStore<STORE> = FixedStore::new();
+    let mut clean = [WindowStats::ZERO; BASELINE];
+    let mut baseline = Baseline::new();
+    let mut level: i32 = 0;
 
     println!("mq2 gas_anomaly: warming up...");
 
@@ -50,44 +55,42 @@ fn main() -> ! {
             *w = raw as i32;
             delay.delay_millis(10);
         }
-        // --- features ---
-        let mut sum = 0i64;
-        let mut peak = 0i32;
-        for &v in window.iter() {
-            sum += v as i64;
-            if v > peak {
-                peak = v;
-            }
-        }
-        let mean = (sum / W as i64) as i32;
-        let slope = window[W - 1] - window[0];
-        let hv = enc.encode(&[mean, peak, slope]);
+        let s = WindowStats::of(&window);
 
         if t < WARMUP {
             // MQ-2 heater settling - ignore.
         } else if t < WARMUP + BASELINE {
-            // Enroll clean-air baseline; track the worst clean-air spread.
-            if !store.is_empty() {
-                let d = store.nearest(&hv).unwrap().1;
-                if d > max_baseline {
-                    max_baseline = d;
-                }
-            }
-            store.insert(hv, (t - WARMUP) as u32).ok();
-            println!("enroll mean={}", mean);
+            // Collect clean air; it can only be encoded once the baseline level is known.
+            clean[t - WARMUP] = s;
+            baseline.add(&s);
+            println!("enroll mean={}", s.mean);
         } else {
             if threshold == 0 {
+                // Enroll the clean-air windows against this unit's level; track the worst spread.
+                level = baseline.level().unwrap_or(1);
+                for (i, c) in clean.iter().enumerate() {
+                    let hv = enc.encode(&relative(c, level));
+                    if !store.is_empty() {
+                        let d = store.nearest(&hv).unwrap().1;
+                        if d > max_baseline {
+                            max_baseline = d;
+                        }
+                    }
+                    store.insert(hv, i as u32).ok();
+                }
                 threshold = max_baseline + 70;
-                println!("baseline ceiling d={} -> threshold={}", max_baseline, threshold);
+                println!("baseline level={} ceiling d={} -> threshold={}", level, max_baseline,
+                    threshold);
             }
-            let d = store.nearest(&hv).unwrap().1;
+            let f = relative(&s, level);
+            let d = store.nearest(&enc.encode(&f)).unwrap().1;
             recent_over[ri % M] = d > threshold;
             ri += 1;
             let count = recent_over.iter().filter(|&&b| b).count();
             if count >= K {
-                println!("mean={} d={} ANOMALY: smoke/gas", mean, d);
+                println!("mean={} rel={:?} d={} ANOMALY: smoke/gas", s.mean, f, d);
             } else {
-                println!("mean={} d={} ok", mean, d);
+                println!("mean={} rel={:?} d={} ok", s.mean, f, d);
             }
         }
         t += 1;

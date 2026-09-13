@@ -59,6 +59,7 @@ cargo run --release --example smart_sensor   # synthetic sensor -> encode -> det
 cargo run --release --example ivf_eval        # IVF index: recall vs speed frontier (sub-linear nearest)
 cargo run --release --example hamming_bench    # core-op throughput on the host
 cargo run --release --example dna_eval         # k-mer encoding with bind + permute: strands, shifts, errors
+cargo run --release --example relative_features # per-unit baseline features: same result on every board
 ```
 
 The microcontroller crates need Espressif's Rust toolchain (`espup`) and target hardware (see

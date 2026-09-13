@@ -4,6 +4,7 @@
 pub mod hv;
 pub mod store;
 pub mod encode;
+pub mod features;
 pub mod simhash;
 pub mod reject;
 
