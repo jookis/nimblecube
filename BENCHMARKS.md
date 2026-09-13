@@ -235,3 +235,31 @@ search**: the store stays mutable.
 **Untested idea:** hold the codebook in PSRAM rather than flash. §8 measured PSRAM random reads at
 ~12.8 µs per 512 B against flash's ~63 µs here, and the whole table can be computed at boot in
 ~0.43 s (4,096 × 105 µs), which would remove the 2 MB of flash entirely. No number claimed.
+
+## 11. Accuracy vs mature tooling (host, public datasets)
+
+The one benchmark that could sink the project: does nimblecube actually detect anomalies as well as
+established methods, or is it only fast? Run on **19 public ADBench/ODDS datasets** (6 to 36 features,
+129 to 49,097 rows) under a novelty protocol: train on 60% of the normal rows only, test on the rest
+plus every anomaly, 5 seeds. nimblecube uses the real `FeatureEncoder`; baselines are PyOD defaults.
+Harness and instructions in [`bench/`](bench/).
+
+Mean over the 19 datasets:
+
+| method | ROC-AUC | avg precision | notes |
+|---|---|---|---|
+| 1-NN Euclidean on floats | **0.887** | **0.784** | same scoring rule, no encoding |
+| nimblecube, 64 levels | 0.872 | 0.762 | |
+| nimblecube, 16 levels (device default) | 0.853 | 0.749 | beats HBOS 12/19, LODA 17/19 |
+| Isolation Forest | 0.844 | 0.692 | |
+| HBOS | 0.799 | 0.613 | |
+| LODA | 0.787 | 0.595 | |
+
+**Honest reading.** nimblecube clearly beats the fast histogram baselines (HBOS, LODA) it is usually
+compared with, and ties Isolation Forest at 64 levels. It **loses to plain nearest-neighbour on the raw
+floats**: the binary encoding costs ~0.03 ROC-AUC here, so on small numeric vectors the encoding buys
+no accuracy, only the integer-only, fixed-512-B, `POPCNT`-friendly representation that the rest of these
+benchmarks measure. Its edge is where a raw distance is unavailable or expensive (sequences, symbols,
+many mixed sensors bound into one vector), not on small dense tables. Resolution matters: 16 to 64
+levels recovers about half the gap, but 64 levels would need `64^3 × 512 B` = 128 MB of codebook (§10),
+so the device default stays at 16.

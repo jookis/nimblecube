@@ -60,6 +60,7 @@ cargo run --release --example ivf_eval        # IVF index: recall vs speed front
 cargo run --release --example hamming_bench    # core-op throughput on the host
 cargo run --release --example dna_eval         # k-mer encoding with bind + permute: strands, shifts, errors
 cargo run --release --example relative_features # per-unit baseline features: same result on every board
+cargo run --release --example tabular_eval      # scorer for the accuracy benchmark (see bench/)
 ```
 
 The microcontroller crates need Espressif's Rust toolchain (`espup`) and target hardware (see
