@@ -103,3 +103,72 @@ pub fn simhash_f32(v: &[f32], seed: u64) -> Hv {
     }
     Hv(out)
 }
+
+/// The raw projection accumulators behind `simhash_f32`, written to `out`
+/// instead of being thresholded: the "liquid" point, before it is snapped to a
+/// cube corner. `simhash_f32(v, seed)` is exactly `out[b] > 0.0` per bit.
+///
+/// Costs 16 KB of caller-provided space at `DIM_BITS = 4096`, which is why the
+/// encoder itself does not go through here: the chip path must stay alloc-free
+/// and 512 bytes wide. This exists for asymmetric scoring on the query side,
+/// where one liquid vector is held per query rather than per stored item.
+///
+/// An empty input yields all-zero accumulators.
+pub fn project_f32(v: &[f32], seed: u64, out: &mut [f32; DIM_BITS]) {
+    for b in 0..DIM_BITS {
+        let mut state = mix(seed, b) | 1;
+        let mut acc: f32 = 0.0;
+        let mut i = 0;
+        while i < v.len() {
+            let signs = xs(&mut state);
+            let n = if v.len() - i < 64 { v.len() - i } else { 64 };
+            for k in 0..n {
+                let flip = ((((signs >> k) & 1) ^ 1) << 31) as u32;
+                acc += f32::from_bits(v[i + k].to_bits() ^ flip);
+            }
+            i += n;
+        }
+        out[b] = acc;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rand_vec(state: &mut u64, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                let r = xs(state);
+                ((r >> 40) as f32 / 8_388_608.0) - 1.0
+            })
+            .collect()
+    }
+
+    /// `project_f32` is the un-snapped `simhash_f32`: thresholding its output at
+    /// zero must reproduce the packed code bit for bit, or the asymmetric score
+    /// is measuring a different projection than the store was built with.
+    #[test]
+    fn project_sign_matches_simhash() {
+        let mut state = 0x1234_5678_9abc_def1u64;
+        for d in [1usize, 7, 64, 65, 128, 768] {
+            let v = rand_vec(&mut state, d);
+            let packed = simhash_f32(&v, 99);
+            let mut acc = [0f32; DIM_BITS];
+            project_f32(&v, 99, &mut acc);
+            for b in 0..DIM_BITS {
+                let from_acc = acc[b] > 0.0;
+                let from_packed = (packed.0[b / 64] >> (b % 64)) & 1 == 1;
+                assert_eq!(from_acc, from_packed, "bit {} diverged at d={}", b, d);
+            }
+        }
+    }
+
+    /// Empty input must not leave the accumulators uninitialized or non-zero.
+    #[test]
+    fn project_of_empty_is_zero() {
+        let mut acc = [1f32; DIM_BITS];
+        project_f32(&[], 7, &mut acc);
+        assert!(acc.iter().all(|&x| x == 0.0));
+    }
+}

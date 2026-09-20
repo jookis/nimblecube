@@ -263,3 +263,28 @@ benchmarks measure. Its edge is where a raw distance is unavailable or expensive
 many mixed sensors bound into one vector), not on small dense tables. Resolution matters: 16 to 64
 levels recovers about half the gap, but 64 levels would need `64^3 × 512 B` = 128 MB of codebook (§10),
 so the device default stays at 16.
+
+## 12. Liquid query: what leaving the query un-snapped is worth (host)
+
+Everything above snaps both sides of a comparison to a cube corner. The alternative keeps the **query**
+as raw projection accumulators (`simhash::project_f32`) and leaves the store binary, so each stored bit
+only selects add or subtract. No multiplies, and no extra bytes per stored item.
+
+Bussgang's theorem fixes the payoff in closed form: snapping both sides carries a gain of `2/pi`, one
+side `sqrt(2/pi)`, so the estimator-variance ratio is `pi/2` at cosine 0.
+
+Measured, 8000 trials per row, input width 256, both estimators unbiased (|bias| <= 0.001):
+
+| cosine | 0.00 | 0.40 | 0.70 | 0.90 |
+|---|---|---|---|---|
+| variance ratio | **1.552** | 1.608 | 1.608 | 1.142 |
+| predicted | 1.571 (`pi/2`) | 1.613 | 1.624 | 1.142 |
+
+**Verdict: not worth doing.** Theory and measurement agree within 1.5%, and the payoff is the constant
+`pi/2` and nothing more: a liquid query against the 4096-bit store is worth a binary store of 6355 bits.
+Host cost is 59 ns binary vs 5060 ns liquid; that ratio will not transfer (the host has hardware
+`POPCNT`, the LX7 does not, §3), but it cannot be favourable enough to matter. The whole question is on
+the compare side, and §9 shows compare is not the bottleneck: searching 12,000 items costs 1.6% of one
+`simhash` encode.
+
+Kept as a closed door. `cargo run --release --example liquid_query_eval -- [trials]`
