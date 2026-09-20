@@ -43,3 +43,36 @@ bench/env/bin/python bench/bench_pyod.py target/release/examples/tabular_eval mi
 
 Datasets and the `env/` and `tabwork_*/` working directories are git-ignored; only the code is tracked.
 ADBench is MIT-licensed; the datasets are redistributed there from the ODDS collection.
+
+# Sequence benchmark: nimblecube vs sequence baselines
+
+The second half of the same question, on variable-length symbolic sequences rather than numeric rows,
+because §11 claims the edge should be there. Results in [`../BENCHMARKS.md`](../BENCHMARKS.md) §13.
+
+Data: UCI *UNIX User Data* (T. Lane, id 141, CC BY 4.0), 9 users' shell token streams split into sessions.
+Task: name the user who typed a session. Baselines are hand-written here, so only numpy is required:
+exact sparse n-gram cosine, hashed TF-IDF with a logistic model, Levenshtein, and zlib compression
+distance.
+
+```bash
+# 1. dataset
+mkdir -p bench/seqdata && cd bench/seqdata
+curl -sfLO https://archive.ics.uci.edu/static/public/141/unix+user+data.zip
+unzip -q unix+user+data.zip && tar xzf UNIX_user_data.tar.gz && cd ../..
+
+# 2. sessions -> token id files
+python3 bench/seq_prep.py bench/seqdata/UNIX_user_data bench/seqwork
+
+# 3. the nimblecube half, one run per n-gram size
+cargo build --release --example seq_eval
+for n in 1 2 3 4; do
+  ./target/release/examples/seq_eval bench/seqwork/train.txt bench/seqwork/test.txt \
+      bench/seqwork/hdc_n$n.txt $n
+done
+
+# 4. baselines and scoring
+python3 bench/seq_bench.py bench/seqwork bench/seqwork --sub=150
+```
+
+`--sub` limits how many test sessions the two slow baselines use (they compare against every training
+session with a costly distance). `seqdata/` and `seqwork/` are working directories, not tracked.

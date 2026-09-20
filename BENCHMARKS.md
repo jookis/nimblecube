@@ -288,3 +288,58 @@ the compare side, and §9 shows compare is not the bottleneck: searching 12,000 
 `simhash` encode.
 
 Kept as a closed door. `cargo run --release --example liquid_query_eval -- [trials]`
+
+## 13. Sequences: testing the claim §11 makes (host, public dataset)
+
+§11 ends by expecting the edge to lie "where a raw distance is unavailable or expensive (sequences,
+symbols...)". This section puts that expectation on a public sequence dataset. The result is negative,
+and the dataset's own character (below) matters as much as the numbers.
+
+**Task.** UCI *UNIX User Data* (T. Lane, id 141, CC BY 4.0): sanitised shell token streams for 9 users,
+split into sessions by the `**SOF**` / `**EOF**` markers. Given a session, name the user. Sessions are
+variable length symbolic sequences with no fixed alignment, which is the shape the claim is about.
+Chronological 70/30 split per user (habits drift over two years, so a random split leaks), vocabulary
+from the training sessions only: 3,699 train, 1,589 test, vocab 1,583, median session 19 tokens,
+majority class 0.291.
+
+**Encoding.** The standard HDC n-gram scheme, on the real `Hv` operations: a random vector per token,
+position inside an n-gram by `permute(i)`, n-gram = `bind` of its permuted tokens, session = `bundle`
+of its n-grams. Length drops out, so any two sessions compare directly. Scored two ways: nearest
+training session, and nearest class bundle (9 vectors total).
+
+| method | accuracy | macro F1 | bytes/item |
+|---|---|---|---|
+| hashed TF-IDF + linear, n=1 | **0.785** | **0.741** | ~40 (shared model) |
+| n-gram cosine 1-NN, n=1 | 0.675 | 0.633 | 84 |
+| **nimblecube 1-NN, n=1** | 0.605 | 0.564 | 512 |
+| nimblecube 1-NN, n=2 | 0.604 | 0.548 | 512 |
+| nimblecube centroid, n=2 | 0.549 | 0.522 | 512 (9 vectors) |
+| compression 1-NN (zlib NCD) | 0.533 | 0.502 | 35 |
+| edit distance 1-NN | 0.500 | 0.486 | 158 |
+| majority class | 0.291 | 0.050 | 0 |
+
+Baselines are hand-written (n-gram counts with an exact sparse cosine; n-grams hashed to 4,096 dims,
+the same budget as one hypervector, with TF-IDF and multinomial logistic regression). The two 1-NN
+sequence baselines ran on a 150-session subsample because they are `O(train)` per query with a costly
+distance. Timings are not comparable across implementations (Rust, numpy and plain Python are mixed),
+so only accuracy and bytes are reported here.
+
+**Verdict on this dataset: no accuracy edge.** A linear model on hashed n-grams scores 18 points higher
+while being twelve times smaller and needing no per-item search; nimblecube lands above the two expensive
+sequence methods and below the two cheap ones. That matches §11 on a second data type: **on a host, the
+encoding buys the representation, not the accuracy.**
+
+**The caveat, found in the results themselves.** For every method `n=1` beat `n=2` and `n=3`, so order
+carries almost no signal here: it is a bag-of-commands task, not a sequence task. The specific claim
+about shift and indel tolerance is therefore still untested. The fair test is order-carrying sequences
+corrupted by insertions and deletions, where n-gram counts break down; `examples/dna_eval.rs` shows
+100% recall under 10% indels and is the shape to benchmark against alignment baselines.
+
+**Why this outcome is expected.** Bundling n-grams is a lossy random projection of the n-gram count
+vector into a fixed 512 B. It cannot beat exact counts, only approximate them with integer-only work.
+Wherever exact counts are affordable, which is any host, this should lose. The case for the encoding
+rests on fixed size and `POPCNT`-friendly operations on a microcontroller, not on accuracy.
+
+Reproduce: download the dataset, then `bench/seq_prep.py` to cut it into sessions,
+`cargo run --release --example seq_eval -- <train.txt> <test.txt> <out.txt> [n]` for the nimblecube half,
+and `bench/seq_bench.py` for the baselines and scoring. Only numpy is needed.
