@@ -32,6 +32,17 @@
 //! `nprobe=2` fixes 100% of those misses for 460 compares. Widening the probe
 //! beats both detecting and repairing, and its cost is deterministic, which
 //! matters more than average cost on a device with a deadline.
+//!
+//! **Triangle-inequality certificate** (measured 2026-09-29). Probe one cell, take
+//! candidate `c` at distance `r`, then scan `c`'s build-time neighbour list up to
+//! `2r`. Anything closer than `c` must be in that ball, so the result is proven exact:
+//!
+//! ```text
+//! cap=32: certificate 100% at 460 compares, nprobe=2 100% at 460  (tie)
+//! cap=16: certificate 100% at 860 compares, nprobe=2 62.6% at 832
+//! uniform: lists empty, certificate unavailable on 500 of 500 queries
+//! cost: 59 list entries per item, O(n^2) build (72M compares)
+//! ```
 
 use nimblecube_core::hv::{Hv, DIM_BITS, WORDS};
 
@@ -115,21 +126,29 @@ impl NetTree {
 
     /// Probe the `nprobe` nearest nets. Returns (best distance, compares, ranked nets).
     fn query(&self, items: &[Hv], q: &Hv, nprobe: usize) -> (u32, u64, Vec<usize>) {
+        let (bd, _, compares, ranked) = self.query_id(items, q, nprobe);
+        (bd, compares, ranked)
+    }
+
+    /// As `query`, also returning the id of the best item.
+    fn query_id(&self, items: &[Hv], q: &Hv, nprobe: usize) -> (u32, u32, u64, Vec<usize>) {
         let mut nd: Vec<(u32, usize)> =
             self.nets.iter().enumerate().map(|(c, net)| (net.hamming(q), c)).collect();
         nd.sort_by_key(|x| x.0);
         let mut compares = self.nets.len() as u64;
         let mut bd = u32::MAX;
+        let mut bi = u32::MAX;
         for &(_, c) in nd.iter().take(nprobe.min(nd.len())) {
             for &id in &self.members[c] {
                 let d = items[id as usize].hamming(q);
                 compares += 1;
                 if d < bd {
                     bd = d;
+                    bi = id;
                 }
             }
         }
-        (bd, compares, nd.iter().map(|x| x.1).collect())
+        (bd, bi, compares, nd.iter().map(|x| x.1).collect())
     }
 
     fn total_members(&self) -> usize {
@@ -290,6 +309,127 @@ fn run_fallback(items: &[Hv], queries: &[Hv], truth: &Truth, cap: usize) {
     println!();
 }
 
+/// Build-time neighbour lists: for each item, every other item within `radius`,
+/// sorted by distance. Returns the lists and the build work in compares.
+fn neighbour_lists(items: &[Hv], radius: u32) -> (Vec<Vec<(u32, u32)>>, u64) {
+    let n = items.len();
+    let mut lists: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
+    let mut work = 0u64;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let d = items[i].hamming(&items[j]);
+            work += 1;
+            if d <= radius {
+                lists[i].push((d, j as u32));
+                lists[j].push((d, i as u32));
+            }
+        }
+    }
+    for l in lists.iter_mut() {
+        l.sort_unstable();
+    }
+    (lists, work)
+}
+
+/// Triangle-inequality certificate. Probe one cell, get candidate `c` at distance
+/// `r`. Any item closer to the query than `r` lies within `2r - 1` of `c`, so
+/// scanning `c`'s list up to that radius returns the exact nearest. If the list
+/// radius is below `2r - 1` the certificate is unavailable and the query falls
+/// back to a full scan.
+fn run_certificate(items: &[Hv], queries: &[Hv], truth: &Truth, cap: usize, label: &str) {
+    let list_radius = (DIM_BITS / 4) as u32;
+    let (tree, _) = build_greedy(items, cap, list_radius);
+    let (lists, build) = neighbour_lists(items, list_radius);
+    let entries: usize = lists.iter().map(|l| l.len()).sum();
+    let n = items.len();
+
+    let mut base_hit = 0usize;
+    let mut cert_hit = 0usize;
+    let mut fixed = 0usize;
+    let mut unavailable = 0usize;
+    let mut cmp_raw = 0u64;
+    let mut cmp_dedup = 0u64;
+    let mut scanned_max = 0usize;
+    for (qi, q) in queries.iter().enumerate() {
+        let (r, c, base_cmp, ranked) = tree.query_id(items, q, 1);
+        let base_ok = r == truth.d[qi];
+        if base_ok {
+            base_hit += 1;
+        }
+        cmp_raw += base_cmp;
+        cmp_dedup += base_cmp;
+        let bound = 2 * r;
+        if bound > list_radius + 1 {
+            unavailable += 1;
+            cmp_raw += n as u64;
+            cmp_dedup += n as u64;
+            cert_hit += 1;
+            continue;
+        }
+        let probed = &tree.members[ranked[0]];
+        let mut bd = r;
+        let mut scanned = 0usize;
+        for &(dc, id) in &lists[c as usize] {
+            if dc >= bound {
+                break;
+            }
+            scanned += 1;
+            cmp_raw += 1;
+            if probed.contains(&id) {
+                continue;
+            }
+            cmp_dedup += 1;
+            let d = items[id as usize].hamming(q);
+            if d < bd {
+                bd = d;
+            }
+        }
+        scanned_max = scanned_max.max(scanned);
+        if bd == truth.d[qi] {
+            cert_hit += 1;
+            if !base_ok {
+                fixed += 1;
+            }
+        }
+    }
+    let nq = queries.len() as f64;
+    let misses = queries.len() - base_hit;
+    let (mut p2_hit, mut p2_cmp) = (0usize, 0u64);
+    for (qi, q) in queries.iter().enumerate() {
+        let (bd, cmp, _) = tree.query(items, q, 2);
+        if bd == truth.d[qi] {
+            p2_hit += 1;
+        }
+        p2_cmp += cmp;
+    }
+    println!("certificate ({}, cap={}, list radius {}):", label, cap, list_radius);
+    println!("  nprobe=1 recall        : {:.1}%  ({} misses)", 100.0 * base_hit as f64 / nq, misses);
+    println!("  certified recall       : {:.1}%", 100.0 * cert_hit as f64 / nq);
+    if misses > 0 {
+        println!("  misses fixed           : {} of {}", fixed, misses);
+    }
+    println!("  unavailable (2r > list): {} of {}", unavailable, queries.len());
+    println!(
+        "  avg compares           : {:.0} raw, {:.0} skipping probed cell ({:.1}x)",
+        cmp_raw as f64 / nq,
+        cmp_dedup as f64 / nq,
+        n as f64 / (cmp_dedup as f64 / nq)
+    );
+    println!(
+        "  nprobe=2 for reference : {:.1}% recall, {:.0} compares",
+        100.0 * p2_hit as f64 / nq,
+        p2_cmp as f64 / nq
+    );
+    println!("  largest list scanned   : {}", scanned_max);
+    println!(
+        "  list storage           : {} entries, {:.1} per item; build {} compares",
+        entries,
+        entries as f64 / n as f64,
+        build
+    );
+    println!();
+}
+
 /// Stage 1b: does learning from a fallback make the miss rate decay?
 ///
 /// On a miss the full scan has already found the true nearest, so its id is free.
@@ -367,7 +507,10 @@ fn main() {
     run_fallback(&items, &queries, &truth, 64);
     run_fallback(&items, &queries, &truth, 32);
     run_repair(&items, &queries, &truth, 32, 5);
+    run_certificate(&items, &queries, &truth, 32, "clustered");
+    run_certificate(&items, &queries, &truth, 16, "clustered");
 
     let rtruth = truth_of(&rand_items, &rand_queries);
     run_recall(&rand_items, &rand_queries, &rtruth, "uniform-random (no structure expected)");
+    run_certificate(&rand_items, &rand_queries, &rtruth, 32, "uniform-random");
 }
