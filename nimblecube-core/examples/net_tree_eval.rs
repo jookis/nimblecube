@@ -43,6 +43,19 @@
 //! uniform: lists empty, certificate unavailable on 500 of 500 queries
 //! cost: 59 list entries per item, O(n^2) build (72M compares)
 //! ```
+//!
+//! **Cross-polytope hash in place of cell ranking** (measured 2026-09-29). Hash the
+//! query to the nearest face of the cube after a Walsh-Hadamard rotation, certify
+//! the bucket's best item, fall back when the hash fails. Hash cost is an op-count
+//! estimate in compare-equivalents, not timing:
+//!
+//! ```text
+//! m=256 : hash ok 92.0%, fallback cells 100% at 152 (78.9x), full scan 1075
+//! m=1024: hash ok 87.4%, fallback cells 100% at 293 (40.9x)
+//! m=4096: hash ok 85.4%, fallback cells 100% at 953 (12.6x)
+//! ```
+//!
+//! The fallback decides it: 8% of queries hashing off-cluster cost a full scan each.
 
 use nimblecube_core::hv::{Hv, DIM_BITS, WORDS};
 
@@ -430,6 +443,161 @@ fn run_certificate(items: &[Hv], queries: &[Hv], truth: &Truth, cap: usize, labe
     println!();
 }
 
+/// Cross-polytope hash: take `m` fixed bit positions as +-1, flip fixed random
+/// signs, Walsh-Hadamard transform, and return the face the largest coordinate
+/// points at (one of `2m` buckets).
+struct CrossPolytope {
+    bits: Vec<usize>,
+    signs: Vec<i32>,
+}
+
+impl CrossPolytope {
+    fn new(m: usize, s: &mut u64) -> Self {
+        let mut pool: Vec<usize> = (0..DIM_BITS).collect();
+        for i in (1..DIM_BITS).rev() {
+            pool.swap(i, (xs(s) as usize) % (i + 1));
+        }
+        pool.truncate(m);
+        let signs = (0..m).map(|_| if xs(s) & 1 == 0 { 1 } else { -1 }).collect();
+        CrossPolytope { bits: pool, signs }
+    }
+
+    fn hash(&self, h: &Hv) -> usize {
+        let mut y: Vec<i32> = self
+            .bits
+            .iter()
+            .zip(&self.signs)
+            .map(|(&b, &sg)| if (h.0[b / 64] >> (b % 64)) & 1 == 1 { sg } else { -sg })
+            .collect();
+        let m = y.len();
+        let mut len = 1;
+        while len < m {
+            for i in (0..m).step_by(2 * len) {
+                for j in i..i + len {
+                    let (a, b) = (y[j], y[j + len]);
+                    y[j] = a + b;
+                    y[j + len] = a - b;
+                }
+            }
+            len *= 2;
+        }
+        let (mut bi, mut bv) = (0usize, -1i32);
+        for (i, &v) in y.iter().enumerate() {
+            if v.abs() > bv {
+                bv = v.abs();
+                bi = 2 * i + (v < 0) as usize;
+            }
+        }
+        bi
+    }
+
+    /// Hash cost in compare-equivalents: m*log2(m) add/subs plus m sign loads,
+    /// counted against 64 word ops per compare. An op-count estimate, not timing.
+    fn cost(&self) -> f64 {
+        let m = self.bits.len() as f64;
+        (m * m.log2() + m) / WORDS as f64
+    }
+}
+
+/// Scan `c`'s neighbour list below `2r`, skipping ids in `skip`. Returns the best
+/// distance and the compares spent. Exact whenever `2r - 1` is within the list radius.
+fn certify(items: &[Hv], lists: &[Vec<(u32, u32)>], q: &Hv, c: u32, r: u32, skip: &[u32]) -> (u32, u64) {
+    let mut bd = r;
+    let mut cmp = 0u64;
+    for &(dc, id) in &lists[c as usize] {
+        if dc >= 2 * r {
+            break;
+        }
+        if skip.contains(&id) {
+            continue;
+        }
+        cmp += 1;
+        let d = items[id as usize].hamming(q);
+        if d < bd {
+            bd = d;
+        }
+    }
+    (bd, cmp)
+}
+
+/// Replace cell ranking with a cross-polytope hash, then certify the bucket's
+/// best item with the neighbour lists. When the hash fails (empty bucket, or `2r`
+/// past the list radius) fall back either to a full scan or to the cell path
+/// (cap=32 tree, nprobe=1, certified), which itself falls back to a full scan.
+fn run_hash_certificate(items: &[Hv], queries: &[Hv], truth: &Truth) {
+    let list_radius = (DIM_BITS / 4) as u32;
+    let (lists, _) = neighbour_lists(items, list_radius);
+    let (tree, _) = build_greedy(items, 32, list_radius);
+    let n = items.len();
+    let nq = queries.len() as f64;
+    println!("hash -> certificate (list radius {}, fallback tree cap=32):", list_radius);
+    println!(
+        "  {:>5} {:>8} {:>8} {:>10} {:>9} {:>9} {:>9} {:>9} {:>8}",
+        "m", "buckets", "hash ok", "fallback", "recall", "compares", "hash eq", "total", "speedup"
+    );
+    let mut s: u64 = 0xC0FF_EE11;
+    for &m in &[256usize, 1024, 4096] {
+        let cp = CrossPolytope::new(m, &mut s);
+        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); 2 * m];
+        for (i, h) in items.iter().enumerate() {
+            buckets[cp.hash(h)].push(i as u32);
+        }
+        for fallback in ["full scan", "cells"] {
+            let (mut hit, mut ok, mut cmp) = (0usize, 0usize, 0u64);
+            for (qi, q) in queries.iter().enumerate() {
+                let bucket = &buckets[cp.hash(q)];
+                let (mut r, mut c) = (u32::MAX, 0u32);
+                for &id in bucket {
+                    let d = items[id as usize].hamming(q);
+                    cmp += 1;
+                    if d < r {
+                        r = d;
+                        c = id;
+                    }
+                }
+                let bd = if !bucket.is_empty() && 2 * r <= list_radius + 1 {
+                    ok += 1;
+                    let (bd, k) = certify(items, &lists, q, c, r, bucket);
+                    cmp += k;
+                    bd
+                } else if fallback == "cells" {
+                    let (r2, c2, k, ranked) = tree.query_id(items, q, 1);
+                    cmp += k;
+                    if 2 * r2 <= list_radius + 1 {
+                        let (bd, k2) = certify(items, &lists, q, c2, r2, &tree.members[ranked[0]]);
+                        cmp += k2;
+                        bd
+                    } else {
+                        cmp += n as u64;
+                        truth.d[qi]
+                    }
+                } else {
+                    cmp += n as u64;
+                    truth.d[qi]
+                };
+                if bd == truth.d[qi] {
+                    hit += 1;
+                }
+            }
+            let avg = cmp as f64 / nq;
+            let total = avg + cp.cost();
+            println!(
+                "  {:>5} {:>8} {:>7.1}% {:>10} {:>8.1}% {:>9.0} {:>9.0} {:>9.0} {:>7.1}x",
+                m,
+                2 * m,
+                100.0 * ok as f64 / nq,
+                fallback,
+                100.0 * hit as f64 / nq,
+                avg,
+                cp.cost(),
+                total,
+                n as f64 / total
+            );
+        }
+    }
+    println!();
+}
+
 /// Stage 1b: does learning from a fallback make the miss rate decay?
 ///
 /// On a miss the full scan has already found the true nearest, so its id is free.
@@ -509,6 +677,7 @@ fn main() {
     run_repair(&items, &queries, &truth, 32, 5);
     run_certificate(&items, &queries, &truth, 32, "clustered");
     run_certificate(&items, &queries, &truth, 16, "clustered");
+    run_hash_certificate(&items, &queries, &truth);
 
     let rtruth = truth_of(&rand_items, &rand_queries);
     run_recall(&rand_items, &rand_queries, &rtruth, "uniform-random (no structure expected)");
