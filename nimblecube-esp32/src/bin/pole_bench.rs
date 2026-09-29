@@ -28,8 +28,18 @@
 //! 2-9x. Poles only is slower than linear on four of six: ranking every item on
 //! every query costs more than the compares it saves. The rest goes to bound
 //! work, each visited member's pole row read from a scattered place in PSRAM,
-//! while the linear scan reads sequentially and stops early. Storing items and
-//! pole rows in cell order would make those reads sequential; not yet tried.
+//! while the linear scan reads sequentially and stops early.
+//!
+//! **Cell-order storage, measured the same day: no effect.** Layout B moves
+//! items and pole rows so each cell is contiguous (in place, then re-checked
+//! against the linear answers). Every variant stayed within 1-6% of layout A
+//! (tight < 384: shuttle 5331 vs 5328 us, mammography 2066 vs 1950 us). So the
+//! scattered-read diagnosis above was wrong: shuttle's 51 compares explain about
+//! 1 ms of 5.3 ms, and the rest is unmeasured CPU work (cell ranking and sort,
+//! the per-member bound loop). Per-phase timing is the next step. Side effect:
+//! the linear scan on synthetic data ran 2x slower in cell order (118 vs 59 ms),
+//! because arrival order spreads every cluster through the list and lets the
+//! early stop trigger sooner; speedups use the arrival-order baseline.
 
 #![no_std]
 #![no_main]
@@ -192,6 +202,48 @@ impl Index {
         Index { poles, table, nets, members, parent, radius, rings }
     }
 
+    /// Renumber items so each cell's members are contiguous, moving the items
+    /// in place (one spare `Hv`, no second copy of the store) and rebuilding the
+    /// pole table in the new order. Cell membership, parents and rings keep
+    /// their meaning; only the ids change.
+    fn order_by_cell(&mut self, items: &mut [Hv]) {
+        let n = items.len();
+        let k = self.k();
+        // perm[new] = old
+        let perm: Vec<u32> = self.members.iter().flatten().copied().collect();
+        let mut table = Vec::with_capacity(n * k);
+        for &old in &perm {
+            table.extend_from_slice(&self.table[old as usize * k..(old as usize + 1) * k]);
+        }
+        self.table = table;
+        // in-place gather by cycles: items[new] = old items[perm[new]]
+        let mut done = vec![false; n];
+        for start in 0..n {
+            if done[start] {
+                continue;
+            }
+            let spare = items[start].clone();
+            let mut cur = start;
+            loop {
+                done[cur] = true;
+                let src = perm[cur] as usize;
+                if src == start {
+                    items[cur] = spare;
+                    break;
+                }
+                items[cur] = items[src].clone();
+                cur = src;
+            }
+        }
+        let mut next = 0u32;
+        for m in self.members.iter_mut() {
+            for id in m.iter_mut() {
+                *id = next;
+                next += 1;
+            }
+        }
+    }
+
     fn k(&self) -> usize {
         self.poles.len()
     }
@@ -301,9 +353,9 @@ fn encode(cols: usize, raw: &[i32], rows: usize) -> Vec<Hv> {
 }
 
 /// Run every variant on one dataset; returns the report lines.
-fn run(name: &str, items: &[Hv], queries: &[Hv], anom: &[bool]) -> Vec<String> {
+fn run(name: &str, items: &mut [Hv], queries: &[Hv], anom: &[bool]) -> Vec<String> {
     let tb = Instant::now();
-    let ix = Index::build(items);
+    let mut ix = Index::build(items);
     let build_ms = tb.elapsed().as_millis();
     let mut lines = Vec::new();
     let n_anom = anom.iter().filter(|&&a| a).count();
@@ -330,32 +382,52 @@ fn run(name: &str, items: &[Hv], queries: &[Hv], anom: &[bool]) -> Vec<String> {
 
     let mut order: Vec<(u32, u32)> = Vec::with_capacity(items.len());
     let mut dq: Vec<u16> = Vec::with_capacity(K);
-    for (label, rule) in [
-        ("poles only", Rule::PolesOnly),
-        ("combined", Rule::Always),
-        ("rings + poles", Rule::Never),
-        ("tight < 384", Rule::Tight),
-        ("tight < best", Rule::TightBest),
-    ] {
-        let (mut hit, mut cmp) = (0usize, 0u64);
-        let t = Instant::now();
-        for (qi, q) in queries.iter().enumerate() {
-            let (d, c) = query(&ix, items, black_box(q), rule, &mut order, &mut dq);
-            hit += (d == truth[qi]) as usize;
-            cmp += c as u64;
+    // A: arrival order. B: items and pole rows stored cell by cell.
+    for layout in ["A arrival", "B cell order"] {
+        if layout == "B cell order" {
+            ix.order_by_cell(items);
+            let t = Instant::now();
+            let mut same = 0usize;
+            for (qi, q) in queries.iter().enumerate() {
+                same += (linear_nearest(items, black_box(q)) == truth[qi]) as usize;
+            }
+            let us = t.elapsed().as_micros() / queries.len() as u64;
+            lines.push(format!("  {:<26} {:>8} us/query  answers unchanged {}/{}", "linear, cell order", us, same, queries.len()));
+            println!("{}", lines.last().unwrap());
         }
-        let us = t.elapsed().as_micros() / queries.len() as u64;
-        lines.push(format!(
-            "  {:<14} {:>8} us/query  recall {}/{}  compares {}  speedup {}x (compares {}x)",
-            label,
-            us,
-            hit,
-            queries.len(),
-            cmp / queries.len() as u64,
-            lin_us / us.max(1),
-            items.len() as u64 * queries.len() as u64 / cmp.max(1)
-        ));
-        println!("{}", lines.last().unwrap());
+        for (label, rule) in [
+            ("poles only", Rule::PolesOnly),
+            ("combined", Rule::Always),
+            ("rings + poles", Rule::Never),
+            ("tight < 384", Rule::Tight),
+            ("tight < best", Rule::TightBest),
+        ] {
+            // poles only ranks every item globally, so layout cannot help it
+            if layout == "B cell order" && matches!(rule, Rule::PolesOnly) {
+                continue;
+            }
+            let (mut hit, mut cmp) = (0usize, 0u64);
+            let t = Instant::now();
+            for (qi, q) in queries.iter().enumerate() {
+                let (d, c) = query(&ix, items, black_box(q), rule, &mut order, &mut dq);
+                hit += (d == truth[qi]) as usize;
+                cmp += c as u64;
+            }
+            let us = t.elapsed().as_micros() / queries.len() as u64;
+            let x10 = lin_us * 10 / us.max(1);
+            lines.push(format!(
+                "  {:<12} {:<13} {:>8} us/query  recall {}/{}  compares {}  speedup {}.{}x",
+                layout,
+                label,
+                us,
+                hit,
+                queries.len(),
+                cmp / queries.len() as u64,
+                x10 / 10,
+                x10 % 10
+            ));
+            println!("{}", lines.last().unwrap());
+        }
     }
     lines
 }
@@ -408,7 +480,7 @@ fn main() -> ! {
             })
             .collect();
         drop(bases);
-        report.extend(run("synthetic", &items, &queries, &[false; Q]));
+        report.extend(run("synthetic", &mut items, &queries, &[false; Q]));
     }
 
     // real datasets from certdata.bin
@@ -432,10 +504,10 @@ fn main() -> ! {
         let train = to_i32(take(stored * cols * 4));
         let test = to_i32(take(nq * cols * 4));
         let anom: Vec<bool> = take(nq).iter().map(|&l| l == 1).collect();
-        let items = encode(cols, &train, stored);
+        let mut items = encode(cols, &train, stored);
         drop(train);
         let queries = encode(cols, &test, nq);
-        report.extend(run(&name, &items, &queries, &anom));
+        report.extend(run(&name, &mut items, &queries, &anom));
     }
 
     loop {
