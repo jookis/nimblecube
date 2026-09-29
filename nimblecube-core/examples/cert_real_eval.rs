@@ -27,6 +27,24 @@
 //! certify and fall back to a full scan. Two bugs found on the way, both from
 //! exact duplicates: an unsigned wrap gave a truncated list a huge radius, and
 //! the lazy table skipped a first bucket whose failure was truncation, not distance.
+//!
+//! **Anomaly scores** (same run). Does "failed to certify" flag anomalies, and does
+//! dividing by the certified radius (local density, as in LOF) beat plain distance?
+//! ROC-AUC; "cheap" = best item of the first non-empty hash bucket, no full search:
+//!
+//! ```text
+//!                         annthyroid mammography satellite pendigits shuttle
+//! exact nearest               0.850       0.809     0.840     0.999   0.990
+//! exact / radius k=1024       0.844       0.799     0.833     0.999   0.990
+//! cheap nearest               0.844       0.806     0.824     0.956   0.990
+//! cheap / radius k=1024       0.842       0.799     0.822     0.956   0.990
+//! flag k=1024                 0.642       0.575     0.720     0.861   0.989
+//! cheap compares / exact   1196/3999   2171/6553  309/2639 181/4028 3050/27351
+//! ```
+//!
+//! Density normalisation never helps and the flag is poor. The cheap bucket
+//! distance stays within 0.006 of exact on three of five for 3-22x fewer
+//! compares. One seed, so gaps under ~0.01 are noise.
 
 use std::collections::BinaryHeap;
 use std::io::{BufRead, BufReader};
@@ -450,7 +468,79 @@ fn evaluate(name: &str, items: &[Hv], queries: &[Hv], anom: &[bool]) {
             report(variant, &k.to_string(), &t);
         }
     }
+
+    // Anomaly scores. "cheap" uses the first non-empty hash bucket's best item
+    // (or the first cell if both buckets are empty): no list scan, no full search.
+    // Radius is the item's certified radius, 0 when it certifies nothing.
+    let nearest_id: Vec<u32> = queries
+        .iter()
+        .map(|q| (0..n as u32).min_by_key(|&i| items[i as usize].hamming(q)).unwrap())
+        .collect();
+    let rad = |c: u32, k: usize| lists.radius(c as usize, k).map_or(0.0, |r| r as f64);
+    let (mut cheap, mut cheap_cmp) = (Vec::with_capacity(nq), 0f64);
+    for q in queries {
+        let mut best: Option<(u32, u32)> = None;
+        for t in 0..2 {
+            cheap_cmp += CrossPolytope::cost();
+            for &id in &buckets[t][cps[t].hash(q)] {
+                cheap_cmp += 1.0;
+                let d = items[id as usize].hamming(q);
+                if best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, id));
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        let (d, id, _, cmp) = match best {
+            Some((d, id)) => (d, id, 0, 0),
+            None => tree.query(items, q, 1),
+        };
+        cheap_cmp += cmp as f64;
+        cheap.push((d, id));
+    }
+    let ratio = |d: u32, c: u32, k: usize| d as f64 / (rad(c, k) + 1.0);
+    let scores: Vec<(&str, Vec<f64>)> = vec![
+        ("exact nearest", (0..nq).map(|i| truth[i] as f64).collect()),
+        ("exact / radius k=64", (0..nq).map(|i| ratio(truth[i], nearest_id[i], 64)).collect()),
+        ("exact / radius k=1024", (0..nq).map(|i| ratio(truth[i], nearest_id[i], KMAX)).collect()),
+        ("cheap nearest", cheap.iter().map(|&(d, _)| d as f64).collect()),
+        ("cheap / radius k=64", cheap.iter().map(|&(d, c)| ratio(d, c, 64)).collect()),
+        ("cheap / radius k=1024", cheap.iter().map(|&(d, c)| ratio(d, c, KMAX)).collect()),
+        (
+            "flag k=1024",
+            cheap.iter().map(|&(d, c)| (d > 0 && (2 * d - 1) as f64 > rad(c, KMAX)) as u8 as f64).collect(),
+        ),
+    ];
+    println!("  anomaly score ROC-AUC (cheap path: {:.0} compares/query, exact: {})", cheap_cmp / nq as f64, n);
+    for (name, s) in &scores {
+        println!("    {:<24} {:.3}", name, roc_auc(s, anom));
+    }
     println!();
+}
+
+/// ROC-AUC by the rank-sum (Mann-Whitney) formula, ties sharing their mean rank.
+/// Higher score = more anomalous.
+fn roc_auc(score: &[f64], anom: &[bool]) -> f64 {
+    let mut idx: Vec<usize> = (0..score.len()).collect();
+    idx.sort_by(|&a, &b| score[a].partial_cmp(&score[b]).unwrap());
+    let mut rank = vec![0f64; score.len()];
+    let mut i = 0;
+    while i < idx.len() {
+        let mut j = i;
+        while j + 1 < idx.len() && score[idx[j + 1]] == score[idx[i]] {
+            j += 1;
+        }
+        for &k in &idx[i..=j] {
+            rank[k] = (i + j) as f64 / 2.0 + 1.0;
+        }
+        i = j + 1;
+    }
+    let p = anom.iter().filter(|&&a| a).count() as f64;
+    let neg = anom.len() as f64 - p;
+    let sum: f64 = (0..anom.len()).filter(|&i| anom[i]).map(|i| rank[i]).sum();
+    (sum - p * (p + 1.0) / 2.0) / (p * neg)
 }
 
 fn main() {
