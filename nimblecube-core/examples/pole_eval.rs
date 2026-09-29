@@ -61,8 +61,25 @@
 //! Centre compares carry the clustered case (synthetic 3.5x to 55.8x) and waste
 //! compares on dense real data, where cells are wide. Rings + poles nearly match
 //! poles only on real data with 3-12x fewer bound ops. The hash start hurts on
-//! dense data: buckets fill with near-duplicates. Next: compare a cell's centre
-//! only when the cell is tight.
+//! dense data: buckets fill with near-duplicates.
+//!
+//! **Tight-cell rule** (same run): compare a cell's centre only when its radius
+//! is under a threshold, or under the best distance found so far:
+//!
+//! ```text
+//!                  synthetic annthyroid mammography satellite pendigits  shuttle
+//! cell radius p50       198       719        892       841       914     774
+//! tight < 256..512    55.8x      113x       183x      5.8x      7.8x    248x
+//! tight < 768         55.8x       66x       167x      5.7x      7.9x    152x
+//! tight < best        55.8x      110x       178x      5.7x      8.0x    217x
+//! ```
+//!
+//! Any threshold from 256 to 512 takes the centre route on the synthetic
+//! clusters and the rings route on all real data, matching the better of the
+//! two everywhere within 10%. It works because the regimes are far apart
+//! (radius ~200 vs 600+); data with radii in between would test it properly.
+//! Poles only still wins compares on duplicate-heavy data (mammography 432x)
+//! at 7x the bound ops.
 
 use std::io::{BufRead, BufReader};
 
@@ -370,12 +387,38 @@ fn evaluate_combined(name: &str, items: &[Hv], queries: &[Hv], anom: &[bool]) {
         buckets[cp.hash(h)].push(i as u32);
     }
 
-    println!("{}: {} stored, {} queries ({} anomalies), {} cells, {} poles", name, n, nq, n_anom, nets.len(), k);
+    let mut rs = radius.clone();
+    rs.sort_unstable();
+    println!(
+        "{}: {} stored, {} queries ({} anomalies), {} cells, {} poles, cell radius p10 {} p50 {} p90 {}",
+        name,
+        n,
+        nq,
+        n_anom,
+        nets.len(),
+        k,
+        rs[rs.len() / 10],
+        rs[rs.len() / 2],
+        rs[rs.len() * 9 / 10]
+    );
     println!(
         "  {:<18} {:>7} {:>11} {:>11} {:>9} {:>11}",
         "variant", "recall", "cmp normal", "cmp anomaly", "speedup", "bound ops"
     );
-    for variant in ["poles only", "combined", "combined + hash", "rings + poles"] {
+    // "tight < T": compare a cell's centre only if its radius is under T bits;
+    // "tight < best": only if its radius is under the best distance found so far.
+    for variant in [
+        "poles only",
+        "combined",
+        "combined + hash",
+        "rings + poles",
+        "tight < 256",
+        "tight < 384",
+        "tight < 512",
+        "tight < 768",
+        "tight < best",
+    ] {
+        let fixed: Option<u32> = variant.strip_prefix("tight < ").and_then(|t| t.parse().ok());
         let (mut hit, mut cmp_n, mut cmp_a, mut ops) = (0usize, 0f64, 0f64, 0u64);
         for (qi, q) in queries.iter().enumerate() {
             let dq: Vec<u32> = ps.iter().map(|p| p.hamming(q)).collect();
@@ -414,12 +457,17 @@ fn evaluate_combined(name: &str, items: &[Hv], queries: &[Hv], anom: &[bool]) {
                     .collect();
                 ops += (rings.len() * k) as u64;
                 order.sort_unstable();
-                // "rings + poles" skips the cell-centre compare and its two bounds
-                let use_centre = variant != "rings + poles";
                 for &(lb, c) in &order {
                     if lb >= best {
                         break;
                     }
+                    // whether to pay the centre compare for its two bounds
+                    let use_centre = match variant {
+                        "combined" | "combined + hash" => true,
+                        "rings + poles" => false,
+                        "tight < best" => radius[c] < best,
+                        _ => radius[c] < fixed.unwrap(),
+                    };
                     let dc = if use_centre {
                         cmp += 1.0;
                         nets[c].hamming(q)
