@@ -313,9 +313,10 @@ struct Row {
 const HASH_ONLY: usize = 4; // variant that times the hash alone, no recall
 
 /// Best item in `ids` not already marked in `seen`, then certify it. Marks `ids`
-/// in `seen`; the caller clears them. Items marked by an earlier failed bucket
-/// are all farther than any certifiable candidate, so skipping them stays exact.
-fn bucket_cert(items: &[Hv], lists: &Lists, q: &Hv, ids: &[u32], seen: &mut [u32; BITMAP]) -> Option<u32> {
+/// in `seen`; the caller clears them. The certified result is exact over every
+/// item except those marked by an earlier bucket, so the caller takes the min
+/// with that bucket's best. Returns (certified distance, bucket best).
+fn bucket_cert(items: &[Hv], lists: &Lists, q: &Hv, ids: &[u32], seen: &mut [u32; BITMAP]) -> (Option<u32>, u32) {
     let (mut r, mut c) = (u32::MAX, 0u32);
     for &id in ids {
         if seen[id as usize / 32] >> (id % 32) & 1 == 1 {
@@ -329,9 +330,9 @@ fn bucket_cert(items: &[Hv], lists: &Lists, q: &Hv, ids: &[u32], seen: &mut [u32
     }
     mark(seen, ids, true);
     if r == u32::MAX {
-        return None;
+        return (None, r);
     }
-    lists.certify(items, q, c, r, seen)
+    (lists.certify(items, q, c, r, seen), r)
 }
 
 /// Cells nprobe=1, then certify. Falls back to a full scan if unavailable.
@@ -442,10 +443,10 @@ fn main() -> ! {
                     }
                     3 | 5 => {
                         let b0 = &buckets[cp.hash(q)];
-                        let mut out = bucket_cert(&items, &lists, q, b0, &mut seen);
+                        let (mut out, r0) = bucket_cert(&items, &lists, q, b0, &mut seen);
                         if out.is_none() && v == 5 {
                             let b1 = &buckets2[cp2.hash(q)];
-                            out = bucket_cert(&items, &lists, q, b1, &mut seen);
+                            out = bucket_cert(&items, &lists, q, b1, &mut seen).0.map(|d| d.min(r0));
                             mark(&mut seen, b1, false);
                         }
                         mark(&mut seen, b0, false);

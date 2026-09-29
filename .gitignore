@@ -15,3 +15,4 @@ bench/tabwork_*/
 bench/seqdata/
 bench/seqwork/
 bench/seq_bench_result.json
+bench/certwork/
