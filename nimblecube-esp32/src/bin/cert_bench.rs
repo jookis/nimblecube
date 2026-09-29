@@ -17,8 +17,11 @@
 //! cells -> certificate  :  9820 us   recall 100/100
 //! hash256 -> cert/cells :  2812 us   recall 100/100, 10 fallbacks   21x
 //! hash256 alone         :   153 us
+//! hash256 x2 lazy       :  2109 us   recall 100/100,  1 fallback    28x
 //! build: tree 66.5 s, neighbour lists 966 s (all pairs)
 //! ```
+//!
+//! The lazy second table is consulted only when the first bucket fails.
 //!
 //! The 3x ratio between hash and cells transferred (3.5x here); the 79x against
 //! linear did not (21x), the same access-pattern penalty `net_tree_bench` showed.
@@ -307,6 +310,30 @@ struct Row {
     fell_back: usize,
 }
 
+const HASH_ONLY: usize = 4; // variant that times the hash alone, no recall
+
+/// Best item in `ids` not already marked in `seen`, then certify it. Marks `ids`
+/// in `seen`; the caller clears them. Items marked by an earlier failed bucket
+/// are all farther than any certifiable candidate, so skipping them stays exact.
+fn bucket_cert(items: &[Hv], lists: &Lists, q: &Hv, ids: &[u32], seen: &mut [u32; BITMAP]) -> Option<u32> {
+    let (mut r, mut c) = (u32::MAX, 0u32);
+    for &id in ids {
+        if seen[id as usize / 32] >> (id % 32) & 1 == 1 {
+            continue;
+        }
+        let d = items[id as usize].hamming(q);
+        if d < r {
+            r = d;
+            c = id;
+        }
+    }
+    mark(seen, ids, true);
+    if r == u32::MAX {
+        return None;
+    }
+    lists.certify(items, q, c, r, seen)
+}
+
 /// Cells nprobe=1, then certify. Falls back to a full scan if unavailable.
 fn cells_cert(items: &[Hv], tree: &NetTree, lists: &Lists, q: &Hv, seen: &mut [u32; BITMAP]) -> (u32, bool) {
     let (r, c, cell) = tree.query(items, q, 1);
@@ -381,6 +408,13 @@ fn main() -> ! {
         buckets[cp.hash(h)].push(i as u32);
     }
 
+    // Second table, consulted only when the first fails (lazy).
+    let cp2 = CrossPolytope::new(&mut hs);
+    let mut buckets2: Vec<Vec<u32>> = (0..2 * M).map(|_| Vec::new()).collect();
+    for (i, h) in items.iter().enumerate() {
+        buckets2[cp2.hash(h)].push(i as u32);
+    }
+
     let mut seen = [0u32; BITMAP];
     let mut truth: Vec<u32> = Vec::with_capacity(Q);
     let t0 = Instant::now();
@@ -390,9 +424,9 @@ fn main() -> ! {
     let lin_us = t0.elapsed().as_micros() / Q as u64;
 
     // Two passes, second in reverse variant order, to expose layout or warm-up drift.
-    let mut rows = [[Row::default(); 5]; 2];
+    let mut rows = [[Row::default(); 6]; 2];
     for pass in 0..2 {
-        let order: [usize; 5] = if pass == 0 { [0, 1, 2, 3, 4] } else { [4, 3, 2, 1, 0] };
+        let order: [usize; 6] = if pass == 0 { [0, 1, 2, 3, 4, 5] } else { [5, 4, 3, 2, 1, 0] };
         for &v in &order {
             let mut row = Row::default();
             let t = Instant::now();
@@ -406,24 +440,15 @@ fn main() -> ! {
                         row.fell_back += fb as usize;
                         d
                     }
-                    3 => {
-                        let b = &buckets[cp.hash(q)];
-                        let (mut r, mut c) = (u32::MAX, 0u32);
-                        for &id in b {
-                            let d = items[id as usize].hamming(q);
-                            if d < r {
-                                r = d;
-                                c = id;
-                            }
+                    3 | 5 => {
+                        let b0 = &buckets[cp.hash(q)];
+                        let mut out = bucket_cert(&items, &lists, q, b0, &mut seen);
+                        if out.is_none() && v == 5 {
+                            let b1 = &buckets2[cp2.hash(q)];
+                            out = bucket_cert(&items, &lists, q, b1, &mut seen);
+                            mark(&mut seen, b1, false);
                         }
-                        let out = if b.is_empty() {
-                            None
-                        } else {
-                            mark(&mut seen, b, true);
-                            let o = lists.certify(&items, q, c, r, &seen);
-                            mark(&mut seen, b, false);
-                            o
-                        };
+                        mark(&mut seen, b0, false);
                         match out {
                             Some(d) => d,
                             None => {
@@ -434,7 +459,7 @@ fn main() -> ! {
                     }
                     _ => cp.hash(q) as u32,
                 };
-                if v != 4 && d == truth[qi] {
+                if v != HASH_ONLY && d == truth[qi] {
                     row.hit += 1;
                 }
                 black_box(d);
@@ -450,6 +475,7 @@ fn main() -> ! {
         "cells -> certificate  ",
         "hash256 -> cert/cells ",
         "hash256 alone         ",
+        "hash256 x2 lazy       ",
     ];
     loop {
         println!("cert_bench (ESP32-S3 @ 240 MHz)  N={} clusters={} cap={} queries={}", N, G, CAP, Q);
@@ -464,7 +490,7 @@ fn main() -> ! {
         println!("linear scan           : {} us/query", lin_us);
         for (v, name) in names.iter().enumerate() {
             let (a, b) = (rows[0][v], rows[1][v]);
-            if v == 4 {
+            if v == HASH_ONLY {
                 println!("{}: {} / {} us/query", name, a.us, b.us);
             } else {
                 println!(

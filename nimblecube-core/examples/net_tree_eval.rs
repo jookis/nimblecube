@@ -56,6 +56,14 @@
 //! ```
 //!
 //! The fallback decides it: 8% of queries hashing off-cluster cost a full scan each.
+//!
+//! **Second hash table** (measured 2026-09-29, m=256, fallback cells):
+//!
+//! ```text
+//! one table : 92.0% ok, 40 fallbacks, 152
+//! both      : 99.0% ok,  5 fallbacks, 186 (pays the second hash every query)
+//! lazy      : 99.0% ok,  5 fallbacks, 129 (second table only when the first fails)
+//! ```
 
 use nimblecube_core::hv::{Hv, DIM_BITS, WORDS};
 
@@ -598,6 +606,124 @@ fn run_hash_certificate(items: &[Hv], queries: &[Hv], truth: &Truth) {
     println!();
 }
 
+/// Best item in `ids` not in `prior`, then certify it. `prior` holds items already
+/// compared by a failed attempt: all farther than this bucket's certifiable best,
+/// so skipping them keeps the result exact. Returns the exact distance if the
+/// certificate holds, and the compares spent either way.
+fn bucket_cert(
+    items: &[Hv],
+    lists: &[Vec<(u32, u32)>],
+    q: &Hv,
+    ids: &[u32],
+    prior: &[u32],
+    list_radius: u32,
+) -> (Option<u32>, u64) {
+    let (mut r, mut c, mut cmp) = (u32::MAX, 0u32, 0u64);
+    for &id in ids {
+        if prior.contains(&id) {
+            continue;
+        }
+        cmp += 1;
+        let d = items[id as usize].hamming(q);
+        if d < r {
+            r = d;
+            c = id;
+        }
+    }
+    if r == u32::MAX || 2 * r > list_radius + 1 {
+        return (None, cmp);
+    }
+    let seen: Vec<u32> = ids.iter().chain(prior).copied().collect();
+    let (bd, k) = certify(items, lists, q, c, r, &seen);
+    (Some(bd), cmp + k)
+}
+
+/// Two cross-polytope tables at m=256. "both" hashes twice and certifies the best
+/// item of the union of the two buckets; "lazy" consults the second table only
+/// when the first fails. Either falls back to the certified cell path.
+fn run_two_tables(items: &[Hv], queries: &[Hv], truth: &Truth) {
+    let list_radius = (DIM_BITS / 4) as u32;
+    let (lists, _) = neighbour_lists(items, list_radius);
+    let (tree, _) = build_greedy(items, 32, list_radius);
+    let n = items.len();
+    let nq = queries.len() as f64;
+    let mut s: u64 = 0xC0FF_EE11; // first table identical to run_hash_certificate's m=256
+    let tables: Vec<CrossPolytope> = (0..2).map(|_| CrossPolytope::new(256, &mut s)).collect();
+    let buckets: Vec<Vec<Vec<u32>>> = tables
+        .iter()
+        .map(|cp| {
+            let mut b: Vec<Vec<u32>> = vec![Vec::new(); 512];
+            for (i, h) in items.iter().enumerate() {
+                b[cp.hash(h)].push(i as u32);
+            }
+            b
+        })
+        .collect();
+    println!("two hash tables (m=256, fallback cells):");
+    println!(
+        "  {:<6} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>8}",
+        "mode", "hash ok", "fallback", "recall", "compares", "hash eq", "total", "speedup"
+    );
+    for mode in ["one", "both", "lazy"] {
+        let (mut hit, mut fell, mut cmp, mut hashes) = (0usize, 0usize, 0u64, 0u64);
+        for (qi, q) in queries.iter().enumerate() {
+            let b0 = &buckets[0][tables[0].hash(q)];
+            hashes += 1;
+            let (mut out, k) = match mode {
+                "both" => {
+                    let b1 = &buckets[1][tables[1].hash(q)];
+                    hashes += 1;
+                    let mut union = b0.clone();
+                    union.extend(b1.iter().filter(|id| !b0.contains(id)));
+                    bucket_cert(items, &lists, q, &union, &[], list_radius)
+                }
+                _ => bucket_cert(items, &lists, q, b0, &[], list_radius),
+            };
+            cmp += k;
+            if out.is_none() && mode == "lazy" {
+                let b1 = &buckets[1][tables[1].hash(q)];
+                hashes += 1;
+                let (o, k) = bucket_cert(items, &lists, q, b1, b0, list_radius);
+                out = o;
+                cmp += k;
+            }
+            let bd = match out {
+                Some(d) => d,
+                None => {
+                    fell += 1;
+                    let (r, c, k, ranked) = tree.query_id(items, q, 1);
+                    cmp += k;
+                    if 2 * r <= list_radius + 1 {
+                        let (bd, k2) = certify(items, &lists, q, c, r, &tree.members[ranked[0]]);
+                        cmp += k2;
+                        bd
+                    } else {
+                        cmp += n as u64;
+                        truth.d[qi]
+                    }
+                }
+            };
+            if bd == truth.d[qi] {
+                hit += 1;
+            }
+        }
+        let avg = cmp as f64 / nq;
+        let heq = hashes as f64 / nq * tables[0].cost();
+        println!(
+            "  {:<6} {:>7.1}% {:>8} {:>8.1}% {:>9.0} {:>9.0} {:>9.0} {:>7.1}x",
+            mode,
+            100.0 * (queries.len() - fell) as f64 / nq,
+            fell,
+            100.0 * hit as f64 / nq,
+            avg,
+            heq,
+            avg + heq,
+            n as f64 / (avg + heq)
+        );
+    }
+    println!();
+}
+
 /// Stage 1b: does learning from a fallback make the miss rate decay?
 ///
 /// On a miss the full scan has already found the true nearest, so its id is free.
@@ -678,6 +804,7 @@ fn main() {
     run_certificate(&items, &queries, &truth, 32, "clustered");
     run_certificate(&items, &queries, &truth, 16, "clustered");
     run_hash_certificate(&items, &queries, &truth);
+    run_two_tables(&items, &queries, &truth);
 
     let rtruth = truth_of(&rand_items, &rand_queries);
     run_recall(&rand_items, &rand_queries, &rtruth, "uniform-random (no structure expected)");
